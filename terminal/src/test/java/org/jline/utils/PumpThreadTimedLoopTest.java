@@ -12,12 +12,17 @@ import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.FutureTask;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -345,6 +350,111 @@ class PumpThreadTimedLoopTest {
             assertEquals('A', result, "Pump should not have consumed a byte during cancelled poll");
         } finally {
             nbis.close();
+        }
+    }
+
+    @Test
+    void testReadyPollCannotConsumeInputAfterClose() throws Exception {
+        CountDownLatch polling = new CountDownLatch(1);
+        CountDownLatch releasePoll = new CountDownLatch(1);
+        AtomicReference<Thread> pump = new AtomicReference<>();
+        AtomicInteger reads = new AtomicInteger();
+        NonBlockingInputStreamImpl input = new NonBlockingInputStreamImpl("closed-poll", new InputStream() {
+            @Override
+            public int read() {
+                reads.incrementAndGet();
+                return 'z';
+            }
+        });
+        input.setPollFunction(timeout -> {
+            pump.set(Thread.currentThread());
+            polling.countDown();
+            // Native poll can finish after shutdown's bounded join. Model that ordering
+            // explicitly, preserving interruption without letting it release the poll.
+            awaitUninterruptibly(releasePoll);
+            return 1;
+        });
+        FutureTask<Integer> result = new FutureTask<>(() -> input.read(30_000));
+        Thread consumer = new Thread(result, "closed-poll-consumer");
+        try {
+            consumer.start();
+            assertTrue(polling.await(5, TimeUnit.SECONDS), "Pump must enter poll before close");
+            input.close();
+            releasePoll.countDown();
+            pump.get().join(5000);
+            assertTrue(!pump.get().isAlive(), "Pump must stop");
+            assertEquals(0, reads.get(), "Closed pump must not consume the next terminal's input");
+            assertTrue(
+                    assertThrows(ExecutionException.class, () -> result.get(5, TimeUnit.SECONDS))
+                                    .getCause()
+                            instanceof ClosedException);
+        } finally {
+            input.close();
+            releasePoll.countDown();
+            consumer.join(5000);
+            if (pump.get() != null) {
+                pump.get().join(5000);
+            }
+        }
+    }
+
+    @Test
+    void testCloseWaitsForAnAlreadyStartedRead() throws Exception {
+        CountDownLatch reading = new CountDownLatch(1);
+        CountDownLatch releaseRead = new CountDownLatch(1);
+        CountDownLatch closing = new CountDownLatch(1);
+        CountDownLatch closed = new CountDownLatch(1);
+        NonBlockingInputStreamImpl input = new NonBlockingInputStreamImpl("closing-read", new InputStream() {
+            @Override
+            public int read() {
+                reading.countDown();
+                awaitUninterruptibly(releaseRead);
+                return 'z';
+            }
+
+            @Override
+            public void close() {
+                closing.countDown();
+            }
+        });
+        input.setPollFunction(timeout -> 1);
+        FutureTask<Integer> result = new FutureTask<>(() -> input.read(30_000));
+        Thread consumer = new Thread(result, "closing-read-consumer");
+        FutureTask<Void> close = new FutureTask<>(() -> {
+            input.close();
+            closed.countDown();
+            return null;
+        });
+        Thread closer = new Thread(close, "closing-read-closer");
+        try {
+            consumer.start();
+            assertTrue(reading.await(5, TimeUnit.SECONDS));
+            closer.start();
+            assertTrue(closing.await(5, TimeUnit.SECONDS));
+            assertFalse(closed.await(200, TimeUnit.MILLISECONDS), "Close cannot release an active read");
+            releaseRead.countDown();
+            close.get(5, TimeUnit.SECONDS);
+            assertEquals('z', result.get(5, TimeUnit.SECONDS));
+        } finally {
+            releaseRead.countDown();
+            input.close();
+            consumer.join(5000);
+            closer.join(5000);
+        }
+    }
+
+    private static void awaitUninterruptibly(CountDownLatch latch) {
+        boolean interrupted = false;
+        while (true) {
+            try {
+                latch.await();
+                break;
+            } catch (InterruptedException e) {
+                interrupted = true;
+            }
+        }
+        if (interrupted) {
+            Thread.currentThread().interrupt();
         }
     }
 

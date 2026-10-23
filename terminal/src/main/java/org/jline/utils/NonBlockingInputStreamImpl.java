@@ -187,7 +187,10 @@ public class NonBlockingInputStreamImpl extends NonBlockingInputStream {
                             throw new IOException("poll() failed on stdin", e);
                         }
                         if (ret > 0) {
-                            return in.read();
+                            synchronized (NonBlockingInputStreamImpl.this) {
+                                checkClosed();
+                                return in.read();
+                            }
                         } else if (ret == 0) {
                             return READ_EXPIRED;
                         } else {
